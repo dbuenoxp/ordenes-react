@@ -1,5 +1,7 @@
 import React, { useState, useMemo, useEffect } from 'react'
 import { Header, FilterCard, Table, TextInput, Combobox, Modal, Button, Card } from 'storybook-dojo-react'
+import { context as otelContext, trace as otelTrace, propagation as otelPropagation } from '@opentelemetry/api'
+import { tracer as otelTracer } from '../otel/initOtel'
 import clientImg from '../images/client.png'
 
 export default function Orders() {
@@ -24,7 +26,6 @@ export default function Orders() {
     { key: 'actions', label: 'Ver detalle' }
   ]
 
-  // fallback data (used if the endpoint returns nothing or on error)
   const fallbackOrders = [
     {
       id: 1,
@@ -100,11 +101,10 @@ export default function Orders() {
   const statusOptions = [
     { value: '', label: 'Todos' },
     { value: 'Pendiente', label: 'Pendiente' },
-    { value: 'Shipped', label: 'Shipped' },
-    { value: 'Cancelled', label: 'Cancelled' }
+    { value: 'Enviado', label: 'Enviado' },
+    { value: 'Cancelado', label: 'Cancelado' }
   ]
 
-  // Modal to add a quick order (demo)
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [modalCustomer, setModalCustomer] = useState('')
   const [modalStatus, setModalStatus] = useState('')
@@ -123,7 +123,6 @@ export default function Orders() {
     setIsModalOpen(false)
   }
 
-  // helper to map backend order shape to table rows using customers to resolve names
   const openDetail = (order) => {
     setDetailOrder(order)
     setDetailModalOpen(true)
@@ -181,7 +180,7 @@ export default function Orders() {
 
   const statusBadge = (status) => {
     const s = (status || '').toLowerCase()
-    let bg = '#f0ad4e' // default amber
+    let bg = '#f0ad4e'
     let color = '#fff'
     if (s.includes('pend')) { bg = '#f0ad4e'; color = '#fff' }
     if (s.includes('ship') || s.includes('enviado') || s.includes('shipped')) { bg = '#28a745'; color = '#fff' }
@@ -213,42 +212,56 @@ export default function Orders() {
 
   const detailTotal = (detailOrder?.details || []).reduce((s, it) => s + ((it.quantity || 0) * (it.priceUnit || 0)), 0)
 
-  // fetch customers (with fallback)
   useEffect(() => {
     let mounted = true
   const apiUrl = (import.meta.env && import.meta.env.VITE_APIURL) ? import.meta.env.VITE_APIURL : 'http://localhost:8080/'
-  fetch(`${apiUrl}customer/all`)
-      .then(async res => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const data = await res.json()
-        const ok = (Array.isArray(data) && data.length > 0)
-        const toUse = ok ? data : fallbackCustomers
-        if (mounted) {
-          setCustomers(toUse)
-          setCustomersFromEndpoint(Boolean(ok))
+  ;(async () => {
+    try {
+      const url = `${apiUrl}customer/all`
+      let span
+      if (otelTracer && typeof otelTracer.startSpan === 'function') {
+        span = otelTracer.startSpan('fetch.customers')
+      }
+      const headers = new Headers()
+      if (span) {
+        const ctx = otelTrace.setSpan(otelContext.active(), span)
+        try {
+          otelPropagation.inject(ctx, headers, {
+            set: (carrier, key, value) => carrier.set(key, value)
+          })
+        } catch (e) {
+          // ignore propagation errors
         }
-      })
-      .catch(() => {
-        if (mounted) {
-          setCustomers(fallbackCustomers)
-          setCustomersFromEndpoint(false)
-        }
-      })
+      }
+
+      const res = await fetch(url, { headers })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      const ok = (Array.isArray(data) && data.length > 0)
+      const toUse = ok ? data : fallbackCustomers
+      if (mounted) {
+        setCustomers(toUse)
+        setCustomersFromEndpoint(Boolean(ok))
+      }
+      if (span) span.end()
+    } catch (e) {
+      if (mounted) {
+        setCustomers(fallbackCustomers)
+        setCustomersFromEndpoint(false)
+      }
+    }
+  })()
     return () => { mounted = false }
   }, [])
 
-  // runtime diagnostic logging: let host/container or deployment logs know the app mounted and data/source state
   useEffect(() => {
-    // log once on mount
     console.log('[example-app][Orders] mounted')
     try {
-      // set global flag for external monitoring scripts or the static banner in index.html
       if (typeof window !== 'undefined') {
         window.__EXAMPLE_APP_MOUNTED = true
         if (typeof window.__EXAMPLE_APP_DEPLOY_STATUS === 'function') {
           window.__EXAMPLE_APP_DEPLOY_STATUS('App mounted')
         } else {
-          // fallback: update element directly if present
           var el = document.getElementById('deploy-status')
           if (el) el.textContent = 'App mounted'
         }
@@ -258,7 +271,6 @@ export default function Orders() {
     }
   }, [])
 
-  // log when the origin flags or env urls change so it's easy to diagnose deployments
   useEffect(() => {
     try {
       const envApiUrl = (import.meta && import.meta.env && import.meta.env.VITE_APIURL) ? import.meta.env.VITE_APIURL : null
@@ -274,35 +286,47 @@ export default function Orders() {
     }
   }, [customersFromEndpoint, ordersFromEndpoint])
 
-  // fetch orders raw data (with fallback)
   useEffect(() => {
     let mounted = true
     setLoading(true)
   const orderUrl = (import.meta.env && import.meta.env.VITE_ORDERURL) ? import.meta.env.VITE_ORDERURL : 'http://localhost:8081/'
-  fetch(`${orderUrl}order/all`)
-      .then(async res => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const data = await res.json()
-        const ok = (Array.isArray(data) && data.length > 0)
-        const toUse = ok ? data : fallbackOrders
-        if (mounted) {
-          setOrdersRaw(toUse)
-          setOrdersFromEndpoint(Boolean(ok))
-        }
-      })
-      .catch(err => {
-        if (mounted) {
-          setOrdersRaw(fallbackOrders)
-          setOrdersFromEndpoint(false)
-        }
-        setError(err?.message || String(err))
-      })
-      .finally(() => { if (mounted) setLoading(false) })
+  ;(async () => {
+    try {
+      const url = `${orderUrl}order/all`
+      let span
+      if (otelTracer && typeof otelTracer.startSpan === 'function') {
+        span = otelTracer.startSpan('fetch.orders')
+      }
+      const headers = new Headers()
+      if (span) {
+        const ctx = otelTrace.setSpan(otelContext.active(), span)
+        try {
+          otelPropagation.inject(ctx, headers, { set: (carrier, key, value) => carrier.set(key, value) })
+        } catch (e) {}
+      }
+
+      const res = await fetch(url, { headers })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      const ok = (Array.isArray(data) && data.length > 0)
+      const toUse = ok ? data : fallbackOrders
+      if (mounted) {
+        setOrdersRaw(toUse)
+        setOrdersFromEndpoint(Boolean(ok))
+      }
+      if (span) span.end()
+    } catch (err) {
+      if (mounted) {
+        setOrdersRaw(fallbackOrders)
+        setOrdersFromEndpoint(false)
+      }
+      setError(err?.message || String(err))
+    } finally { if (mounted) setLoading(false) }
+  })()
 
     return () => { mounted = false }
   }, [])
 
-  // remap table rows whenever ordersRaw or customers change
   useEffect(() => {
     setTableData(mapOrdersToRows(ordersRaw.length ? ordersRaw : fallbackOrders, customers, openDetail))
   }, [ordersRaw, customers])
@@ -343,7 +367,6 @@ export default function Orders() {
           </FilterCard>
         </div>
 
-        {/* indicators box (endpoint status) */}
         <div style={{ position: 'absolute', right: 24, top: 24 }}>
           <div style={{ width: 220, background: '#fff', borderRadius: 6, boxShadow: '0 6px 18px rgba(0,0,0,0.08)', padding: 12 }}>
             <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>Service Customer</div>
@@ -358,7 +381,6 @@ export default function Orders() {
               <div style={{ fontSize: 12, color: '#444' }}>{ordersFromEndpoint ? 'Desde endpoint' : 'Usando JSON'}</div>
             </div>
             
-            {/* environment indicators */}
             <div style={{ height: 1, background: '#f1f1f1', margin: '10px 0' }} />
             <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>Variables de Entorno</div>
             {(() => {
